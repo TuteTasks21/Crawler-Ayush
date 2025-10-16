@@ -1,0 +1,21 @@
+# Core dependencies
+requests>=2.28.1
+dnspython>=2.2.1
+tldextract>=3.4.0
+python-whois>=0.8.0
+sslyze>=5.1.0
+beautifulsoup4>=4.11.1
+lxml>=4.9.1
+tqdm>=4.64.1
+colorama>=0.4.6
+urllib3>=1.26.12
+idna>=3.4
+cryptography>=38.0.3
+
+# For Google search
+googlesearch-python>=1.1.0
+
+# For data storage and reporting
+pandas>=1.5.1
+matplotlib>=3.6.2
+seaborn>=0.12.1
