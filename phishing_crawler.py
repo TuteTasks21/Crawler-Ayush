@@ -26,31 +26,405 @@ import requests
 import tldextract
 import whois
 import dns.resolver
+import time
+import hashlib
+import pickle
+import numpy as np
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import IsolationForest
+from sentence_transformers import SentenceTransformer
+from functools import lru_cache
+import traceback
+import shutil
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("phishing_crawler.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("PhishingCrawler")
+def setup_logging(log_level=logging.INFO, log_file="phishing_crawler.log"):
+    """Set up logging with file and console handlers"""
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Set up log file with timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(log_dir, f"{timestamp}_{log_file}")
+    
+    # Configure logging
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger("PhishingCrawler")
+
+# Initialize logger
+logger = setup_logging()
+
+class CacheManager:
+    """Manages caching for expensive operations to improve performance"""
+    
+    def __init__(self, cache_dir="cache", max_cache_size_mb=500):
+        """Initialize the cache manager with specified directory and size limit"""
+        self.cache_dir = cache_dir
+        self.max_cache_size_mb = max_cache_size_mb
+        
+        # Create cache directory if it doesn't exist
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Initialize cache stats
+        self.hits = 0
+        self.misses = 0
+        
+        # Clean cache if needed
+        self._clean_cache_if_needed()
+        
+        logger.info(f"Cache initialized at {self.cache_dir} with {max_cache_size_mb}MB limit")
+    
+    def _get_cache_key(self, prefix, data):
+        """Generate a unique cache key for the data"""
+        if isinstance(data, str):
+            data_str = data
+        else:
+            data_str = json.dumps(data, sort_keys=True)
+        
+        return f"{prefix}_{hashlib.md5(data_str.encode()).hexdigest()}"
+    
+    def _get_cache_path(self, key):
+        """Get the file path for a cache key"""
+        return os.path.join(self.cache_dir, f"{key}.cache")
+    
+    def _clean_cache_if_needed(self):
+        """Clean the cache if it exceeds the size limit"""
+        try:
+            # Get total size of cache directory
+            total_size = sum(os.path.getsize(os.path.join(self.cache_dir, f)) 
+                            for f in os.listdir(self.cache_dir) 
+                            if os.path.isfile(os.path.join(self.cache_dir, f)))
+            
+            total_size_mb = total_size / (1024 * 1024)
+            
+            if total_size_mb > self.max_cache_size_mb:
+                logger.info(f"Cache size ({total_size_mb:.2f}MB) exceeds limit ({self.max_cache_size_mb}MB). Cleaning...")
+                
+                # Get all cache files with their modification times
+                cache_files = [(f, os.path.getmtime(os.path.join(self.cache_dir, f))) 
+                              for f in os.listdir(self.cache_dir) 
+                              if os.path.isfile(os.path.join(self.cache_dir, f))]
+                
+                # Sort by modification time (oldest first)
+                cache_files.sort(key=lambda x: x[1])
+                
+                # Remove oldest files until we're under the limit
+                for f, _ in cache_files:
+                    if total_size_mb <= self.max_cache_size_mb * 0.8:  # Clean until we're at 80% of limit
+                        break
+                    
+                    file_path = os.path.join(self.cache_dir, f)
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)
+                    
+                    try:
+                        os.remove(file_path)
+                        total_size_mb -= file_size
+                        logger.debug(f"Removed cache file {f} ({file_size:.2f}MB)")
+                    except Exception as e:
+                        logger.error(f"Failed to remove cache file {f}: {str(e)}")
+        
+        except Exception as e:
+            logger.error(f"Error cleaning cache: {str(e)}")
+    
+    def get(self, prefix, data):
+        """Get data from cache if it exists"""
+        key = self._get_cache_key(prefix, data)
+        cache_path = self._get_cache_path(key)
+        
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    cached_data = pickle.load(f)
+                
+                self.hits += 1
+                logger.debug(f"Cache hit for {prefix} ({self.hits} hits, {self.misses} misses)")
+                return cached_data
+            except Exception as e:
+                logger.error(f"Error reading from cache: {str(e)}")
+                self.misses += 1
+                return None
+        else:
+            self.misses += 1
+            logger.debug(f"Cache miss for {prefix} ({self.hits} hits, {self.misses} misses)")
+            return None
+    
+    def set(self, prefix, data, result):
+        """Store data in cache"""
+        key = self._get_cache_key(prefix, data)
+        cache_path = self._get_cache_path(key)
+        
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(result, f)
+            
+            logger.debug(f"Cached result for {prefix}")
+            return True
+        except Exception as e:
+            logger.error(f"Error writing to cache: {str(e)}")
+            return False
+    
+    def clear(self):
+        """Clear all cache files"""
+        try:
+            for f in os.listdir(self.cache_dir):
+                file_path = os.path.join(self.cache_dir, f)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            
+            logger.info("Cache cleared")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing cache: {str(e)}")
+            return False
+    
+    def get_stats(self):
+        """Get cache statistics"""
+        try:
+            # Get total size of cache directory
+            total_size = sum(os.path.getsize(os.path.join(self.cache_dir, f)) 
+                            for f in os.listdir(self.cache_dir) 
+                            if os.path.isfile(os.path.join(self.cache_dir, f)))
+            
+            total_size_mb = total_size / (1024 * 1024)
+            file_count = len([f for f in os.listdir(self.cache_dir) if os.path.isfile(os.path.join(self.cache_dir, f))])
+            
+            hit_rate = self.hits / (self.hits + self.misses) * 100 if (self.hits + self.misses) > 0 else 0
+            
+            return {
+                "size_mb": total_size_mb,
+                "file_count": file_count,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": hit_rate
+            }
+        except Exception as e:
+            logger.error(f"Error getting cache stats: {str(e)}")
+            return {
+                "error": str(e)
+            }
+
+
+class LocalLLMPhishingDetector:
+    """
+    Local LLM-based phishing detection using sentence embeddings and anomaly detection.
+    This avoids using third-party APIs by implementing local ML techniques.
+    """
+    def __init__(self, cache_dir="cache"):
+        """Initialize the LLM-based phishing detector with local models."""
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Initialize sentence transformer model for text embeddings
+        try:
+            self.model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Loaded sentence transformer model for text embeddings")
+        except Exception as e:
+            logger.error(f"Failed to load sentence transformer model: {str(e)}")
+            self.model = None
+            
+        # Initialize anomaly detection model
+        self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
+        
+        # Initialize TF-IDF vectorizer for content analysis
+        self.tfidf = TfidfVectorizer(max_features=1000)
+        
+        # Cache for domain embeddings and scores
+        self.embedding_cache_file = os.path.join(cache_dir, "domain_embeddings.pkl")
+        self.load_cache()
+        
+    def load_cache(self):
+        """Load cached embeddings and scores if available."""
+        try:
+            if os.path.exists(self.embedding_cache_file):
+                with open(self.embedding_cache_file, 'rb') as f:
+                    self.cache = pickle.load(f)
+                logger.info(f"Loaded {len(self.cache)} cached domain embeddings")
+            else:
+                self.cache = {}
+        except Exception as e:
+            logger.error(f"Failed to load cache: {str(e)}")
+            self.cache = {}
+            
+    def save_cache(self):
+        """Save embeddings and scores to cache."""
+        try:
+            with open(self.embedding_cache_file, 'wb') as f:
+                pickle.dump(self.cache, f)
+            logger.info(f"Saved {len(self.cache)} domain embeddings to cache")
+        except Exception as e:
+            logger.error(f"Failed to save cache: {str(e)}")
+            
+    def get_domain_features(self, domain_info):
+        """Extract features from domain information for analysis."""
+        features = []
+        
+        # Domain name features
+        domain = domain_info.get("domain", "")
+        features.append(domain)
+        
+        # WHOIS features
+        whois_info = domain_info.get("whois", {})
+        if whois_info and not isinstance(whois_info, dict):
+            whois_info = {}
+            
+        registrar = str(whois_info.get("registrar", ""))
+        features.append(registrar)
+        
+        # HTTP features
+        http_info = domain_info.get("http", {})
+        if http_info and not isinstance(http_info, dict):
+            http_info = {}
+            
+        title = str(http_info.get("title", ""))
+        features.append(title)
+        
+        # Combine all text features
+        text_features = " ".join([f for f in features if f])
+        return text_features
+        
+    def get_embedding(self, text):
+        """Get embedding for text using sentence transformer."""
+        if not self.model or not text:
+            return np.zeros(384)  # Default embedding size for all-MiniLM-L6-v2
+            
+        try:
+            return self.model.encode(text)
+        except Exception as e:
+            logger.error(f"Failed to get embedding: {str(e)}")
+            return np.zeros(384)
+            
+    def analyze_domain(self, domain_info):
+        """Analyze domain using local LLM techniques."""
+        domain = domain_info.get("domain", "")
+        
+        # Check cache first
+        cache_key = domain
+        if cache_key in self.cache:
+            logger.debug(f"Using cached analysis for {domain}")
+            return self.cache[cache_key]
+            
+        # Extract features
+        features = self.get_domain_features(domain_info)
+        
+        # Get embedding
+        embedding = self.get_embedding(features)
+        
+        # Calculate lexical features
+        domain_parts = tldextract.extract(domain)
+        domain_name = domain_parts.domain
+        
+        # Calculate entropy as a measure of randomness
+        entropy = 0
+        if domain_name:
+            char_freq = {}
+            for char in domain_name:
+                if char in char_freq:
+                    char_freq[char] += 1
+                else:
+                    char_freq[char] = 1
+                    
+            for char, freq in char_freq.items():
+                prob = freq / len(domain_name)
+                entropy -= prob * np.log2(prob)
+                
+        # Calculate digit ratio
+        digit_ratio = sum(c.isdigit() for c in domain_name) / max(len(domain_name), 1)
+        
+        # Calculate special character ratio
+        special_ratio = sum(not c.isalnum() for c in domain_name) / max(len(domain_name), 1)
+        
+        # Combine features for scoring
+        score = {
+            "embedding": embedding.tolist(),
+            "entropy": float(entropy),
+            "digit_ratio": float(digit_ratio),
+            "special_ratio": float(special_ratio),
+            "domain_length": len(domain_name),
+            "timestamp": time.time()
+        }
+        
+        # Cache the result
+        self.cache[cache_key] = score
+        
+        # Periodically save cache
+        if len(self.cache) % 10 == 0:
+            self.save_cache()
+            
+        return score
+        
+    def detect_anomalies(self, domain_scores):
+        """Detect anomalies in domain scores using Isolation Forest."""
+        if not domain_scores:
+            return {}
+            
+        # Extract features for anomaly detection
+        features = []
+        domains = []
+        
+        for domain, score in domain_scores.items():
+            feature_vector = [
+                score.get("entropy", 0),
+                score.get("digit_ratio", 0),
+                score.get("special_ratio", 0),
+                score.get("domain_length", 0)
+            ]
+            features.append(feature_vector)
+            domains.append(domain)
+            
+        if not features:
+            return {}
+            
+        # Convert to numpy array
+        features = np.array(features)
+        
+        # Fit and predict
+        try:
+            self.anomaly_detector.fit(features)
+            anomaly_scores = self.anomaly_detector.decision_function(features)
+            
+            # Normalize scores to 0-1 range where 0 is most anomalous
+            normalized_scores = (anomaly_scores - np.min(anomaly_scores)) / (np.max(anomaly_scores) - np.min(anomaly_scores) + 1e-10)
+            
+            # Create result dictionary
+            result = {}
+            for i, domain in enumerate(domains):
+                result[domain] = 1.0 - normalized_scores[i]
+                
+            return result
+        except Exception as e:
+            logger.error(f"Failed to detect anomalies: {str(e)}")
+            return {}
 
 class PhishingCrawler:
-    def __init__(self, target_domain, output_dir="output", max_threads=10):
+    def __init__(self, target_domain, output_dir="output", max_threads=10, monitoring_interval=86400):
         """Initialize the phishing crawler with target domain and configuration."""
         self.target_domain = target_domain
         self.output_dir = output_dir
         self.max_threads = max_threads
+        self.monitoring_interval = monitoring_interval  # Default: 24 hours in seconds
         
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Create monitoring directory
+        self.monitoring_dir = os.path.join(output_dir, "monitoring")
+        os.makedirs(self.monitoring_dir, exist_ok=True)
+        
+        # Create cache directory
+        self.cache_dir = os.path.join(output_dir, "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
         
         # Extract domain components
         self.domain_info = tldextract.extract(target_domain)
@@ -62,8 +436,66 @@ class PhishingCrawler:
         self.resolved_domains = set()
         self.enriched_domains = []
         
+        # Initialize LLM-based phishing detector
+        self.llm_detector = LocalLLMPhishingDetector(cache_dir=self.cache_dir)
+        
+        # Initialize monitoring state
+        self.monitoring_state_file = os.path.join(self.monitoring_dir, "monitoring_state.json")
+        self.monitoring_state = self._load_monitoring_state()
+        
+        # Initialize retry mechanism
+        self.max_retries = 3
+        self.retry_delay = 5  # seconds
+        
         logger.info(f"Initialized crawler for target domain: {target_domain}")
         logger.info(f"Base domain identified as: {self.base_domain}")
+        
+    def _load_monitoring_state(self):
+        """Load monitoring state from file if it exists."""
+        if os.path.exists(self.monitoring_state_file):
+            try:
+                with open(self.monitoring_state_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load monitoring state: {str(e)}")
+                return self._initialize_monitoring_state()
+        else:
+            return self._initialize_monitoring_state()
+            
+    def _initialize_monitoring_state(self):
+        """Initialize monitoring state with default values."""
+        return {
+            "last_run": None,
+            "run_history": [],
+            "domain_history": {},
+            "alerts": []
+        }
+        
+    def _save_monitoring_state(self):
+        """Save current monitoring state to file."""
+        try:
+            with open(self.monitoring_state_file, 'w') as f:
+                json.dump(self.monitoring_state, f, indent=2, default=str)
+            logger.info("Saved monitoring state")
+        except Exception as e:
+            logger.error(f"Failed to save monitoring state: {str(e)}")
+            
+    def _update_domain_history(self, domain, data):
+        """Update domain history in monitoring state."""
+        if domain not in self.monitoring_state["domain_history"]:
+            self.monitoring_state["domain_history"][domain] = []
+            
+        # Add current state with timestamp
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "data": data
+        }
+        
+        self.monitoring_state["domain_history"][domain].append(entry)
+        
+        # Limit history size to prevent excessive growth
+        if len(self.monitoring_state["domain_history"][domain]) > 10:
+            self.monitoring_state["domain_history"][domain] = self.monitoring_state["domain_history"][domain][-10:]
 
     def canonicalize_and_scope(self):
         """
@@ -364,12 +796,69 @@ class PhishingCrawler:
             "sans": [domain, f"www.{domain}"]
         }
 
+    def _safe_request(self, url, method="get", timeout=10, max_retries=3, **kwargs):
+        """
+        Make a safe HTTP request with retry mechanism and error handling.
+        """
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                if method.lower() == "get":
+                    response = requests.get(url, timeout=timeout, **kwargs)
+                elif method.lower() == "post":
+                    response = requests.post(url, timeout=timeout, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                    
+                return response
+            except requests.exceptions.RequestException as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.warning(f"Failed to {method} {url} after {max_retries} attempts: {str(e)}")
+                    return None
+                    
+                logger.debug(f"Retrying {method} request to {url} ({retry_count}/{max_retries})")
+                time.sleep(self.retry_delay)
+                
+        return None
+        
+    def _safe_dns_resolve(self, domain):
+        """
+        Safely resolve DNS with retry mechanism and error handling.
+        """
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                answers = dns.resolver.resolve(domain, 'A')
+                ip_addresses = [rdata.address for rdata in answers]
+                return domain, ip_addresses
+            except Exception as e:
+                retry_count += 1
+                if retry_count >= self.max_retries:
+                    logger.debug(f"Failed to resolve {domain} after {self.max_retries} attempts: {str(e)}")
+                    return domain, None
+                    
+                logger.debug(f"Retrying DNS resolution for {domain} ({retry_count}/{self.max_retries})")
+                time.sleep(self.retry_delay)
+                
+        return domain, None
+                
     def _get_http_info(self, domain):
-        """Get HTTP information for a domain."""
-        try:
-            url = f"https://{domain}"
-            response = requests.get(url, timeout=5, allow_redirects=True)
+        """Get HTTP information for a domain with improved error handling."""
+        # Try HTTPS first
+        url = f"https://{domain}"
+        response = self._safe_request(url, timeout=5, allow_redirects=True)
+        
+        # If HTTPS fails, try HTTP
+        if not response:
+            url = f"http://{domain}"
+            response = self._safe_request(url, timeout=5, allow_redirects=True)
             
+        # If both fail, return error
+        if not response:
+            return {"error": "Failed to connect to domain"}
+            
+        try:
             # Parse HTML
             soup = BeautifulSoup(response.text, 'lxml')
             
@@ -382,26 +871,9 @@ class PhishingCrawler:
                 "has_login_form": bool(soup.find('form') and (soup.find('input', {'type': 'password'}) or 'login' in response.text.lower())),
                 "content_length": len(response.text)
             }
-        except:
-            try:
-                # Try HTTP if HTTPS fails
-                url = f"http://{domain}"
-                response = requests.get(url, timeout=5, allow_redirects=True)
-                
-                # Parse HTML
-                soup = BeautifulSoup(response.text, 'lxml')
-                
-                return {
-                    "status_code": response.status_code,
-                    "final_url": response.url,
-                    "redirects": len(response.history),
-                    "server": response.headers.get('Server', ''),
-                    "title": soup.title.string if soup.title else '',
-                    "has_login_form": bool(soup.find('form') and (soup.find('input', {'type': 'password'}) or 'login' in response.text.lower())),
-                    "content_length": len(response.text)
-                }
-            except:
-                return {"error": "Failed to retrieve HTTP information"}
+        except Exception as e:
+            logger.error(f"Error parsing HTTP response for {domain}: {str(e)}")
+            return {"error": f"Failed to parse HTTP response: {str(e)}"}
 
     def _calculate_similarity(self, domain):
         """Calculate similarity between this domain and the target domain."""
@@ -448,92 +920,150 @@ class PhishingCrawler:
 
     def score_and_triage(self):
         """
-        Score and triage enriched domains to identify potential phishing domains.
+        Score and triage enriched domains using LLM-based analysis.
         """
         logger.info("Step 7: Scoring and triaging enriched domains")
         
-        scored_domains = []
+        # Prepare domain scores
+        domain_scores = {}
         
-        for domain_info in self.enriched_domains:
-            score = 0
-            risk_factors = []
+        # Analyze each domain with LLM
+        for domain_info in tqdm(self.enriched_domains, desc="Analyzing domains"):
+            domain = domain_info.get("domain", "")
             
-            # Factor 1: Domain similarity
-            similarity = domain_info.get("similarity", {}).get("similarity_score", 0)
-            if similarity > 80:
-                score += 30
-                risk_factors.append(f"High similarity to target domain ({similarity:.1f}%)")
-            elif similarity > 60:
-                score += 15
-                risk_factors.append(f"Medium similarity to target domain ({similarity:.1f}%)")
-            
-            # Factor 2: Domain age
-            whois_info = domain_info.get("whois", {})
-            creation_date = whois_info.get("creation_date")
-            
-            if creation_date:
-                if isinstance(creation_date, list):
-                    creation_date = creation_date[0]
+            # Skip if domain is empty
+            if not domain:
+                continue
                 
-                try:
-                    domain_age_days = (datetime.datetime.now() - creation_date).days
-                    if domain_age_days < 30:
-                        score += 25
-                        risk_factors.append(f"Recently registered domain ({domain_age_days} days old)")
-                    elif domain_age_days < 90:
-                        score += 15
-                        risk_factors.append(f"Domain registered within last 3 months ({domain_age_days} days old)")
-                except:
-                    pass
+            # Analyze domain using LLM
+            score_data = self.llm_detector.analyze_domain(domain_info)
             
-            # Factor 3: SSL certificate
-            ssl_info = domain_info.get("ssl", {})
-            if "error" in ssl_info:
-                score += 10
-                risk_factors.append("No SSL certificate")
+            # Store score data
+            domain_scores[domain] = score_data
             
-            # Factor 4: Login form
-            http_info = domain_info.get("http", {})
-            if http_info.get("has_login_form", False):
-                score += 20
-                risk_factors.append("Contains login form")
+            # Update domain info with score data
+            domain_info["llm_score"] = score_data
             
-            # Factor 5: Redirects
-            redirects = http_info.get("redirects", 0)
-            if redirects > 0:
-                score += 10
-                risk_factors.append(f"Uses {redirects} redirects")
+            # Update monitoring history
+            self._update_domain_history(domain, domain_info)
             
-            # Determine risk level
-            risk_level = "Low"
-            if score >= 70:
-                risk_level = "Critical"
-            elif score >= 50:
-                risk_level = "High"
-            elif score >= 30:
-                risk_level = "Medium"
-            
-            # Add score and risk level to domain info
-            domain_info["risk_score"] = score
-            domain_info["risk_level"] = risk_level
-            domain_info["risk_factors"] = risk_factors
-            
-            scored_domains.append(domain_info)
+        # Detect anomalies across all domains
+        anomaly_scores = self.llm_detector.detect_anomalies(domain_scores)
         
-        # Sort domains by risk score (descending)
-        scored_domains.sort(key=lambda x: x["risk_score"], reverse=True)
+        # Update domain info with anomaly scores
+        for domain_info in self.enriched_domains:
+            domain = domain_info.get("domain", "")
+            if domain in anomaly_scores:
+                domain_info["anomaly_score"] = anomaly_scores[domain]
+                
+        # Sort domains by anomaly score (highest first)
+        self.enriched_domains.sort(key=lambda x: x.get("anomaly_score", 0), reverse=True)
         
         # Write scored domains to file
         with open(os.path.join(self.output_dir, "scored_domains.json"), "w") as f:
-            json.dump(scored_domains, f, indent=2, default=str)
+            json.dump(self.enriched_domains, f, indent=2, default=str)
+            
+        # Save monitoring state
+        self._save_monitoring_state()
         
-        logger.info(f"Scored {len(scored_domains)} domains")
-        logger.info(f"Critical risk: {sum(1 for d in scored_domains if d['risk_level'] == 'Critical')}")
-        logger.info(f"High risk: {sum(1 for d in scored_domains if d['risk_level'] == 'High')}")
-        logger.info(f"Medium risk: {sum(1 for d in scored_domains if d['risk_level'] == 'Medium')}")
-        logger.info(f"Low risk: {sum(1 for d in scored_domains if d['risk_level'] == 'Low')}")
+        logger.info(f"Scored and triaged {len(self.enriched_domains)} domains")
         
-        return scored_domains
+        return self.enriched_domains
+        
+    def monitor_domains(self, force=False):
+        """
+        Continuously monitor domains for changes over time.
+        """
+        logger.info("Starting domain monitoring")
+        
+        # Check if it's time to run monitoring
+        last_run = self.monitoring_state.get("last_run")
+        current_time = datetime.datetime.now()
+        
+        if last_run:
+            last_run = datetime.datetime.fromisoformat(last_run)
+            time_since_last_run = (current_time - last_run).total_seconds()
+            
+            if time_since_last_run < self.monitoring_interval and not force:
+                logger.info(f"Skipping monitoring, last run was {time_since_last_run} seconds ago")
+                return
+        
+        # Update last run time
+        self.monitoring_state["last_run"] = current_time.isoformat()
+        
+        # Get previously resolved domains
+        previous_domains = set()
+        for run in self.monitoring_state.get("run_history", []):
+            if "domains" in run:
+                previous_domains.update(run.get("domains", []))
+        
+        # Run the crawler to get current domains
+        self.canonicalize_and_scope()
+        self.discover_subdomains()
+        self.generate_mutations()
+        normalized_domains = self.aggregate_and_normalize()
+        current_domains = self.resolve_dns(normalized_domains)
+        
+        # Find new and disappeared domains
+        new_domains = current_domains - previous_domains
+        disappeared_domains = previous_domains - current_domains
+        
+        # Log changes
+        if new_domains:
+            logger.info(f"Found {len(new_domains)} new domains: {', '.join(list(new_domains)[:5])}...")
+            
+            # Add alert for new domains
+            self.monitoring_state["alerts"].append({
+                "timestamp": current_time.isoformat(),
+                "type": "new_domains",
+                "count": len(new_domains),
+                "domains": list(new_domains)
+            })
+            
+        if disappeared_domains:
+            logger.info(f"Found {len(disappeared_domains)} disappeared domains: {', '.join(list(disappeared_domains)[:5])}...")
+            
+            # Add alert for disappeared domains
+            self.monitoring_state["alerts"].append({
+                "timestamp": current_time.isoformat(),
+                "type": "disappeared_domains",
+                "count": len(disappeared_domains),
+                "domains": list(disappeared_domains)
+            })
+        
+        # Update run history
+        self.monitoring_state["run_history"].append({
+            "timestamp": current_time.isoformat(),
+            "domains": list(current_domains),
+            "new_domains": list(new_domains),
+            "disappeared_domains": list(disappeared_domains)
+        })
+        
+        # Limit history size
+        if len(self.monitoring_state["run_history"]) > 30:  # Keep last 30 runs
+            self.monitoring_state["run_history"] = self.monitoring_state["run_history"][-30:]
+            
+        # Limit alerts size
+        if len(self.monitoring_state["alerts"]) > 100:  # Keep last 100 alerts
+            self.monitoring_state["alerts"] = self.monitoring_state["alerts"][-100:]
+        
+        # Save monitoring state
+        self._save_monitoring_state()
+        
+        # If there are new domains, enrich and score them
+        if new_domains:
+            # Enrich only the new domains
+            self.resolved_domains = new_domains
+            self.enrich_and_validate()
+            self.score_and_triage()
+            
+        logger.info("Domain monitoring completed")
+        
+        return {
+            "new_domains": list(new_domains),
+            "disappeared_domains": list(disappeared_domains),
+            "total_domains": len(current_domains)
+        }
 
     def generate_report(self, scored_domains):
         """

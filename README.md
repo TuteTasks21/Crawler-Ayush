@@ -1,146 +1,90 @@
-# Phishing Domain Crawler
+# One-shot Phishing Domain Analyzer
 
-A comprehensive tool for detecting potential phishing domains by analyzing domain permutations, typosquats, and homoglyphs.
+This repository provides a one-shot pipeline to analyze a seed domain and produce:
+- `suspicious_candidates.csv`: Aggregated related/suspicious domains with sources and resolution info.
+- `suspicious_features.csv`: Full feature set for each resolving candidate domain.
 
-## Overview
-
-This tool implements a complete workflow for phishing domain detection:
-
-1. **Canonicalize & Scope**: Normalize target domain and define scope
-2. **Passive Subdomain Discovery**: Find subdomains using Amass
-3. **Mutation Generation**: Generate domain variations using dnstwist and urlcrazy
-4. **Aggregation & Normalization**: Combine and normalize all candidates
-5. **DNS Resolution**: Resolve domains using SanicDNS
-6. **Enrichment & Validation**: Gather WHOIS, SSL, HTTP info
-7. **Scoring & Triage**: Identify high-risk domains
-8. **Reporting**: Generate CSV and HTML reports
-9. **Evidence Archiving**: Save screenshots, HTML, headers, and certificates
+No third-party web APIs are used; only local tools and open-source libraries.
 
 ## Requirements
-
 - Python 3.7+
-- External tools (optional but recommended):
-  - [dnstwist](https://github.com/elceef/dnstwist)
-  - [urlcrazy](https://github.com/urbanadventurer/urlcrazy)
-  - [SanicDNS](https://github.com/hadriansecurity/sanicdns)
-  - [Amass](https://github.com/owasp-amass/amass)
+- Optional local CLI tools (used if present, otherwise fallback logic is applied):
+  - `amass` (passive subdomain discovery)
+  - `dnstwist` (typosquats)
+  - `urlcrazy` (permutations)
+  - `sslyze` or `openssl` (TLS cert details)
 
-## Installation
-
-1. Clone this repository:
-   ```
-   git clone https://github.com/yourusername/phishing-domain-crawler.git
-   cd phishing-domain-crawler
-   ```
-
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-3. (Optional) Install external tools for enhanced functionality:
-   - dnstwist: `pip install dnstwist[full]`
-   - urlcrazy: Follow instructions at [urlcrazy GitHub](https://github.com/urbanadventurer/urlcrazy)
-   - SanicDNS: Follow instructions at [SanicDNS GitHub](https://github.com/hadriansecurity/sanicdns)
-   - Amass: Follow instructions at [Amass GitHub](https://github.com/owasp-amass/amass)
+## Install
+```
+python -m pip install -r requirements.txt
+```
 
 ## Usage
-
-Basic usage:
-
 ```
-python phishing_crawler.py example.com
+python analyze.py example.com -o outdir
+```
+- `-o outdir`: Output directory (default: `outdir`).
+- `-c config.yaml`: Optional config (defaults to repository `config.yaml`).
+
+Outputs:
+- `outdir/suspicious_candidates.csv`
+- `outdir/suspicious_features.csv`
+- `outdir/artifacts/` contains saved HTML, headers, TLS details when available.
+
+## Pipeline Overview
+1. Canonicalize seed domain and probe canonical URLs.
+2. Enumerate subdomains via `amass` if available; fallback to common subdomains.
+3. Generate domain permutations via `dnstwist`/`urlcrazy` if available; robust fallback generator included.
+4. Aggregate and deduplicate into `suspicious_candidates.csv` with columns:
+   - `seed_domain, candidate_domain, source, resolved, resolved_ip, first_seen_ts`
+5. For each candidate, concurrently resolve DNS and probe HTTP (async `httpx` + `dnspython` async).
+6. Enrich with WHOIS, TLS certificate (via `sslyze`/`openssl` when available), and save HTML/headers locally.
+7. Compute features locally and write `suspicious_features.csv` with exact columns:
+   - `URL, Domain, TLD, whois_registered_domain_info, domain_registration_info, port, path_extension, punycode, IP, DomainLength, TLDLength, NoOfLettersInURL, LetterRatioInURL, NoOfDigitsInURL, DigitRatioInURL, CharContinuationRate, ObfuscationRatio, URLCharProb, URLSimilarityIndex, TLDLegitimateProb, HasObfuscation, NoOfObfuscatedChar, abnormal_subdomain, prefix_suffix, random_domain, suspicious_tld, NoOfSubDomain, nb_dots, nb_hyphens, nb_at, nb_www, nb_com, nb_dslash, nb_eq, nb_qm, nb_and, special_char_counts, LineOfCode, Robots, favicon_present, HasHiddenFields`
+
+## Config
+`config.yaml` provides timeouts, thresholds, TLD whitelist/blacklist, common paths, and artifact settings. Example:
+```
+timeouts:
+  dns_timeout_seconds: 5
+  http_timeout_seconds: 8
+  tls_timeout_seconds: 10
+  robots_timeout_seconds: 5
+  concurrency_limit: 50
+
+thresholds:
+  obfuscation_ratio_high: 0.15
+  entropy_random_threshold: 3.5
+
+whitelist_tlds: [com, net, org, edu, gov]
+blacklist_tlds: [zip, mov, country]
+
+common_paths: ['/', '/login', '/signin', '/account', '/secure', '/update', '/index.html']
+
+artifacts:
+  save_html: true
+  save_headers: true
+  save_certs: true
+  out_subdir: artifacts
 ```
 
-Advanced usage:
+## Sample Run
+- Command: `python analyze.py example.com -o outdir`
+- Produces: `outdir/suspicious_candidates.csv`, `outdir/suspicious_features.csv`, and `outdir/artifacts/` with HTML/headers/TLS snapshots where available.
+- Network timeouts are handled gracefully; some domains may not resolve or respond depending on environment policies.
 
+## LLM Assistant Stub
+`llm_assistant.py` provides a stub interface:
 ```
-python phishing_crawler.py example.com -o output_directory -t 20
+from llm_assistant import classify
+result = classify(feature_json)
 ```
+This returns a placeholder label and suggested rules. No LLM logic is implemented now.
 
-### Parameters
-
-- `domain`: Target domain to analyze
-- `-o, --output`: Output directory (default: "output")
-- `-t, --threads`: Maximum number of threads (default: 10)
-
-## Output
-
-The tool generates the following outputs in the specified directory:
-
-- `subdomains.txt`: Discovered subdomains
-- `mutations.txt`: Generated domain mutations
-- `normalized_domains.txt`: Aggregated and normalized domains
-- `resolved_domains.txt`: Domains that resolved to an IP address
-- `enriched_domains.json`: Detailed information about resolved domains
-- `scored_domains.json`: Domains with risk scores and factors
-- `phishing_report.csv`: CSV report of potential phishing domains
-- `phishing_report.html`: HTML report of potential phishing domains
-- `evidence/`: Directory containing evidence for high-risk domains
-
-## Workflow Details
-
-### 1. Canonicalize & Scope
-
-- Normalize the target domain (lowercase, remove www)
-- Define related TLDs to check
-
-### 2. Passive Subdomain Discovery
-
-- Use Amass to discover subdomains through passive techniques
-- Save discovered subdomains to a file
-
-### 3. Mutation Generation
-
-- Generate domain mutations using various algorithms:
-  - Character omission
-  - Character replacement
-  - Character insertion
-  - Homoglyphs
-  - Bitsquatting
-
-### 4. Aggregation & Normalization
-
-- Combine subdomains and mutations
-- Normalize domains (lowercase, punycode)
-- Remove duplicates
-
-### 5. DNS Resolution
-
-- Resolve DNS for candidate domains
-- Keep only domains that resolve to an IP address
-
-### 6. Enrichment & Validation
-
-- Gather WHOIS information (registrar, creation date, etc.)
-- Check SSL certificates
-- Fetch HTTP information (status, redirects, login forms)
-- Calculate similarity to target domain
-
-### 7. Scoring & Triage
-
-- Score domains based on risk factors:
-  - Domain similarity
-  - Domain age
-  - SSL certificate
-  - Login form presence
-  - Redirects
-- Assign risk levels (Critical, High, Medium, Low)
-
-### 8. Reporting
-
-- Generate CSV report
-- Generate HTML report with summary and details
-
-### 9. Evidence Archiving
-
-- Save domain information
-- Create placeholders for screenshots, HTML content, HTTP headers, and SSL certificates
+## Continuous Monitoring (Future Notes)
+- Wrap the one-shot pipeline in a scheduler (e.g., cron/Task Scheduler).
+- Persist historical states, compare deltas, and emit alerts.
+- Add rotating cache and evidence archiving.
 
 ## License
-
-MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+Open-source libraries used; no external web APIs consumed.

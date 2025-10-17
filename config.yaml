@@ -1,0 +1,50 @@
+# Minimal configuration for one-shot Phishing Domain Analyzer
+# All values have safe defaults; override via CLI flags if needed.
+
+timeouts:
+  dns_timeout_seconds: 5
+  http_timeout_seconds: 8
+  tls_timeout_seconds: 10
+  robots_timeout_seconds: 5
+  concurrency_limit: 50
+
+thresholds:
+  obfuscation_ratio_high: 0.15
+  entropy_random_threshold: 3.5
+  similarity_suspicious_threshold: 0.8
+
+# Allowed/blocked TLDs
+whitelist_tlds:
+  - com
+  - net
+  - org
+  - edu
+  - gov
+blacklist_tlds:
+  - zip
+  - mov
+  - country
+
+# Common paths used when probing HTTP
+common_paths:
+  - /
+  - /login
+  - /signin
+  - /account
+  - /secure
+  - /update
+  - /index.html
+
+artifacts:
+  save_html: true
+  save_headers: true
+  save_certs: true
+  out_subdir: artifacts
+
+# Optional executables; if missing, analyzer falls back gracefully
+executables:
+  amass: amass
+  dnstwist: dnstwist
+  urlcrazy: urlcrazy
+  sslyze: sslyze
+  openssl: openssl
